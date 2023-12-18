@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <net/if.h>
 #include <netinet/tcp.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,31 @@
 #include <linux/vm_sockets.h>
 
 #define VSOCK_BUFFER_SIZE 0x10000
+
+// Return 0 if wsl is set to use mirrored networking mode
+int nix_wsl2_mirrored(void)
+{
+    FILE *fp;
+    char path[1035];
+    int ret = 1;
+    
+    // Try to identify networking mode
+    fp = popen("/usr/bin/wslinfo --networking-mode", "r");
+    // Command may not exist in older wsl2 kernels, in which case mirrored networking is not even available
+    if (fp == NULL) {
+        return ret;
+    }
+    
+    if (fgets(path, sizeof(path), fp) != NULL)
+    {
+        if(strncmp(path, "mirrored", 8) == 0) {
+            ret = 0;
+        }
+    }
+    
+    pclose(fp);
+    return ret;
+}
 
 // Return IPv4 family socket.
 int nix_local_create(void)
@@ -164,56 +190,107 @@ int nix_vsock_listen(unsigned int *port)
 // Set custom environment variables with IP values for WSL2.
 void nix_set_env(void)
 {
-    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        perror("socket(AF_INET)");
-        return;
-    }
-
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof ifr);
-    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
-    const int ioctlRet = ioctl(sock, SIOCGIFADDR, &ifr);
-    close(sock);
-    if (ioctlRet != 0)
-    {
-        perror("ioctl(SIOCGIFADDR)");
-        return;
-    }
-
-    // Do not override environment if the name already exists.
-    struct sockaddr_in *addr_in = (struct sockaddr_in *)&ifr.ifr_addr;
-    setenv("WSL_GUEST_IP", inet_ntoa(addr_in->sin_addr), false);
-
-    unsigned long int dest, gateway;
-    char iface[IF_NAMESIZE];
-    char buf[4096];
-
-    memset(iface, 0, sizeof iface);
-    memset(buf, 0, sizeof buf);
-
-    // Read route file to get IP address of default gateway or host.
-    FILE *rfd = fopen("/proc/net/route", "r");
-    if (rfd == NULL)
-    {
-        perror("fopen(route)");
-        return;
-    }
-
-    while (fgets(buf, sizeof buf, rfd))
-    {
-        if (sscanf(buf, "%s %lx %lx", iface, &dest, &gateway) == 3)
+    // Set IP values for WSL2 in mirrored networking mode
+    if(nix_wsl2_mirrored() == 0) {
+        struct ifreq *ifr;
+        struct ifconf ifc;
+        int numif, i;
+        
+        memset(&ifc, 0, sizeof(ifc));
+        ifc.ifc_ifcu.ifcu_req = NULL;
+        ifc.ifc_len = 0;
+        
+        const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
         {
-            if (dest == 0) // Default destination.
-            {
-                struct in_addr addr;
-                addr.s_addr = gateway;
-                setenv("WSL_HOST_IP", inet_ntoa(addr), false);
-                break;
+              perror("socket(AF_INET)");
+              return;
+        }
+
+          
+        if (ioctl(sock, SIOCGIFCONF, &ifc) < 0) {
+            perror("ioctl");
+            return;
+        }
+        
+        if ((ifr = malloc(ifc.ifc_len)) == NULL) {
+            perror("malloc");
+            return;
+        }
+        ifc.ifc_ifcu.ifcu_req = ifr;
+        
+        if (ioctl(sock, SIOCGIFCONF, &ifc) < 0) {
+            perror("ioctl2");
+            return;
+        }    
+        close(sock);
+        numif = ifc.ifc_len / sizeof(struct ifreq);
+        
+        for (i = 0; i < numif; i++) {
+            struct ifreq *r = &ifr[i];
+            struct sockaddr_in *sin = (struct sockaddr_in *)&r->ifr_addr;
+            if(strcmp(inet_ntoa(sin->sin_addr), "127.0.0.1") != 0) {
+                setenv("WSL_GUEST_IP", inet_ntoa(sin->sin_addr), false);
+                setenv("WSL_HOST_IP", inet_ntoa(sin->sin_addr), false);
+              break;
             }
         }
+        free(ifr);
+        return;
     }
+    // Set IP values for WSL2 in NAT mode (not mirrored)
+    else {
+        const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+        {
+            perror("socket(AF_INET)");
+            return;
+        }
 
-    fclose(rfd);
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof ifr);
+        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+        const int ioctlRet = ioctl(sock, SIOCGIFADDR, &ifr);
+        close(sock);
+        if (ioctlRet != 0)
+        {
+            perror("ioctl(SIOCGIFADDR)");
+            return;
+        }
+
+        // Do not override environment if the name already exists.
+        struct sockaddr_in *addr_in = (struct sockaddr_in *)&ifr.ifr_addr;
+        setenv("WSL_GUEST_IP", inet_ntoa(addr_in->sin_addr), false);
+
+        unsigned long int dest, gateway;
+        char iface[IF_NAMESIZE];
+        char buf[4096];
+
+        memset(iface, 0, sizeof iface);
+        memset(buf, 0, sizeof buf);
+
+        // Read route file to get IP address of default gateway or host.
+        FILE *rfd = fopen("/proc/net/route", "r");
+        if (rfd == NULL)
+        {
+            perror("fopen(route)");
+            return;
+        }
+
+        while (fgets(buf, sizeof buf, rfd))
+        {
+            if (sscanf(buf, "%s %lx %lx", iface, &dest, &gateway) == 3)
+            {
+                if (dest == 0) // Default destination.
+                {
+                    struct in_addr addr;
+                    addr.s_addr = gateway;
+                    setenv("WSL_HOST_IP", inet_ntoa(addr), false);
+                    break;
+                }
+            }
+        }
+
+        fclose(rfd);
+    }
 }
